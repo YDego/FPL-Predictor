@@ -3,102 +3,79 @@ from __future__ import annotations
 from pathlib import Path
 import pandas as pd
 
-_POS_MAP = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+API_BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
 
-def _coerce_int(s):
-    return pd.to_numeric(s, errors="coerce").astype("Int64")
-
-def _build_web_name(df: pd.DataFrame) -> pd.Series:
-    cols = {c.lower(): c for c in df.columns}
-    # try direct
-    if "web_name" in cols:
-        wn = df[cols["web_name"]].astype(str)
-        if wn.notna().any():
-            return wn
-    # fallback 1: second_name
-    if "second_name" in cols:
-        sn = df[cols["second_name"]].astype(str)
-        # if also have first_name, use "F. Second"
-        if "first_name" in cols:
-            fn = df[cols["first_name"]].astype(str)
-            initial = fn.str.slice(0, 1).str.upper().fillna("")
-            out = (initial.where(initial.eq(""), initial + ". ") + sn).str.strip()
-            return out.where(out != "", sn)
-        return sn
-    # fallback 2: first + last name variants
-    if "first_name" in cols and "last_name" in cols:
-        fn = df[cols["first_name"]].astype(str)
-        ln = df[cols["last_name"]].astype(str)
-        return (fn.str.slice(0, 1).str.upper() + ". " + ln).str.strip()
-    # last resort: stringified id
-    id_col = cols.get("id", "id")
-    return "P" + df[id_col].astype(str)
-
-def load_player_prices_positions(season_dir: str | Path) -> pd.DataFrame:
+def load_live_prices_positions() -> pd.DataFrame:
     """
-    Returns: player_id, position (GKP/DEF/MID/FWD), now_cost (float £m), team_id, web_name
+    Pull current players from the official FPL API with live prices & availability.
+    Returns current PL players only, with a STABLE player key `code`.
+    Columns:
+      code, player_id, web_name, team_id, team_short, position, now_cost,
+      status, chance_of_playing_next_round, chance_of_playing_this_round
     """
-    season_dir = Path(season_dir)
-    p = season_dir / "players_raw.csv"
-    if not p.exists():
-        raise FileNotFoundError(f"players_raw.csv not found at {p}")
+    import requests
+    r = requests.get(API_BOOTSTRAP, timeout=20)
+    r.raise_for_status()
+    data = r.json()
 
-    df = pd.read_csv(p)
-    cols = {c.lower(): c for c in df.columns}
-    id_col   = cols.get("id", "id")
-    et_col   = cols.get("element_type", "element_type")
-    team_col = cols.get("team", "team")
-    cost_col = cols.get("now_cost", "now_cost")
+    elems = pd.DataFrame(data["elements"])
+    teams = pd.DataFrame(data["teams"])
+    etyp  = pd.DataFrame(data["element_types"])
 
-    out = pd.DataFrame({
-        "player_id": _coerce_int(df[id_col]),
-        "team_id":   _coerce_int(df[team_col]),
-        "position":  pd.to_numeric(df[et_col], errors="coerce").map(_POS_MAP),
-        "now_cost":  pd.to_numeric(df[cost_col], errors="coerce").fillna(0) / 10.0,
+    pos_map_short = etyp.set_index("id")["singular_name_short"].to_dict()  # {1:GKP,2:DEF,3:MID,4:FWD}
+    team_short_map = teams.set_index("id")["short_name"].to_dict()
+    valid_teams = set(team_short_map.keys())
+
+    m = pd.DataFrame({
+        "player_id": elems["id"].astype("int64"),          # season-volatile
+        "code":      elems["code"].astype("int64"),         # season-stable ✅
+        "web_name":  elems["web_name"].astype(str),
+        "team_id":   elems["team"].astype("int64"),
+        "element_type": elems["element_type"].astype("int64"),
+        "now_cost":  elems["now_cost"].astype("float") / 10.0,  # tenths → £m
+        "status":    elems["status"].astype(str),
+        "chance_of_playing_next_round": pd.to_numeric(elems["chance_of_playing_next_round"], errors="coerce"),
+        "chance_of_playing_this_round": pd.to_numeric(elems["chance_of_playing_this_round"], errors="coerce"),
     })
-    out["web_name"] = _build_web_name(df)
-    out = out.dropna(subset=["player_id", "team_id", "position"]).reset_index(drop=True)
-    return out[["player_id", "position", "now_cost", "team_id", "web_name"]]
 
-def load_player_meta(season_dir: str | Path) -> pd.DataFrame:
-    """Lightweight: player_id, team_id, web_name (same fallbacks)."""
-    season_dir = Path(season_dir)
-    p = season_dir / "players_raw.csv"
-    if not p.exists():
-        raise FileNotFoundError(f"players_raw.csv not found at {p}")
-    df = pd.read_csv(p)
-    cols = {c.lower(): c for c in df.columns}
-    id_col   = cols.get("id", "id")
-    team_col = cols.get("team", "team")
+    # keep only current PL squads
+    m = m[m["team_id"].isin(valid_teams)].copy()
+
+    # enrich
+    m["position"]   = m["element_type"].map(pos_map_short)
+    m["team_short"] = m["team_id"].map(team_short_map)
+
+    keep = ["code","player_id","web_name","team_id","team_short","position","now_cost",
+            "status","chance_of_playing_next_round","chance_of_playing_this_round"]
+    return m[keep].reset_index(drop=True)
+
+
+def load_fallback_prices_positions(repo_root: str | Path, season: str) -> pd.DataFrame:
+    """
+    Fallback to Vaastav CSVs if the API is unreachable.
+    (Prices may be stale; `code` still present and is stable.)
+    """
+    sdir = Path(repo_root) / "data" / season
+    players_csv = sdir / "players_raw.csv"
+    teams_csv   = sdir / "teams.csv"
+
+    df = pd.read_csv(players_csv)
+    df.columns = [c.lower() for c in df.columns]
+    teams = pd.read_csv(teams_csv)
+    teams.columns = [c.lower() for c in teams.columns]
+    team_map = teams.set_index("id")["short_name"].to_dict()
+
+    pos_map = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
     out = pd.DataFrame({
-        "player_id": _coerce_int(df[id_col]),
-        "team_id":   _coerce_int(df[team_col]),
-    })
-    out["web_name"] = _build_web_name(df)
-    return out
-
-def load_teams_labels(season_dir: str | Path) -> pd.DataFrame:
-    """
-    Returns: team_id, team_short
-    Guarantees team_short by falling back to 'short_name', 'name', or a 3-letter code.
-    """
-    season_dir = Path(season_dir)
-    p = season_dir / "teams.csv"
-    if not p.exists():
-        raise FileNotFoundError(f"teams.csv not found at {p}")
-    df = pd.read_csv(p)
-    cols = {c.lower(): c for c in df.columns}
-    id_col   = cols.get("id", "id")
-    shortcol = cols.get("short_name", None)
-    namecol  = cols.get("name", None)
-
-    out = pd.DataFrame({"team_id": _coerce_int(df[id_col])})
-    if shortcol:
-        team_short = df[shortcol].astype(str)
-    elif namecol:
-        team_short = df[namecol].astype(str).str.slice(0, 3).str.upper()
-    else:
-        team_short = ("T" + df[id_col].astype(str))
-    out["team_short"] = team_short
-    out = out.dropna(subset=["team_id"]).drop_duplicates("team_id").reset_index(drop=True)
-    return out[["team_id", "team_short"]]
+        "player_id": pd.to_numeric(df["id"], errors="coerce").astype("Int64"),
+        "code":      pd.to_numeric(df["code"], errors="coerce").astype("Int64"),
+        "web_name":  df["web_name"].astype(str),
+        "team_id":   pd.to_numeric(df["team"], errors="coerce").astype("Int64"),
+        "position":  pd.to_numeric(df["element_type"], errors="coerce").map(pos_map),
+        "now_cost":  pd.to_numeric(df.get("now_cost", df.get("value", None)), errors="coerce")/10.0,
+        "status":    df.get("status", pd.Series([None]*len(df))),
+        "chance_of_playing_next_round": pd.to_numeric(df.get("chance_of_playing_next_round", None), errors="coerce"),
+        "chance_of_playing_this_round": pd.to_numeric(df.get("chance_of_playing_this_round", None), errors="coerce"),
+    }).dropna(subset=["player_id","code","team_id","position","now_cost"])
+    out["team_short"] = out["team_id"].map(team_map)
+    return out.reset_index(drop=True)
