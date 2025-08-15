@@ -1,38 +1,63 @@
 # blocks/optimizer.py
 from __future__ import annotations
-from typing import Dict, Iterable
+
+from dataclasses import dataclass
+from typing import Optional, Iterable, Dict
+
 import pandas as pd
-
-try:
-    from pulp import LpProblem, LpVariable, LpBinary, LpMaximize, lpSum, PULP_CBC_CMD, LpStatus
-except ImportError as e:
-    raise ImportError("PuLP is required. Install with: pip install pulp") from e
+from pulp import LpProblem, LpVariable, LpBinary, LpMaximize, lpSum, PULP_CBC_CMD
 
 
-PositionLimits = Dict[str, int]
+@dataclass
+class PositionLimits:
+    GKP: int = 2
+    DEF: int = 5
+    MID: int = 5
+    FWD: int = 3
+    SQUAD: int = 15
 
-DEFAULT_POS_LIMITS: PositionLimits = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
 
-
-def _validate_pool(pool: pd.DataFrame) -> pd.DataFrame:
-    req = {"player_id", "web_name", "team_id", "team_short", "position", "now_cost", "horizon_xpts"}
-    missing = req - set(pool.columns)
+def _validate_pool(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure the candidate pool has everything we need.
+    Accepts either 'player_id' OR 'player_key' (stable code).
+    Creates a 'uid' column used internally by the solver.
+    """
+    required = {
+        "web_name", "team_short", "team_id", "position",
+        "now_cost", "horizon_xpts", "mean_reliability"
+    }
+    missing = required - set(df.columns)
     if missing:
         raise ValueError(f"optimizer: candidate pool missing columns: {missing}")
 
-    pool = pool.copy()
+    if ("player_id" not in df.columns) and ("player_key" not in df.columns):
+        raise ValueError("optimizer: need one of 'player_id' or 'player_key' in candidates")
 
-    # types & sanitization
-    pool["player_id"] = pd.to_numeric(pool["player_id"], errors="coerce").astype(int)
-    pool["team_id"]   = pd.to_numeric(pool["team_id"], errors="coerce").astype(int)
-    pool["now_cost"]  = pd.to_numeric(pool["now_cost"], errors="coerce")
-    pool["horizon_xpts"] = pd.to_numeric(pool["horizon_xpts"], errors="coerce")
+    pool = df.copy()
 
-    pool = pool.dropna(subset=["now_cost", "horizon_xpts"])
-    pool = pool[pool["position"].isin(["GKP","DEF","MID","FWD"])]
+    # build a unique id we can always rely on
+    if "player_id" in pool.columns and pool["player_id"].notna().any():
+        pool["uid"] = pool["player_id"].astype("Int64").astype(str)
+    else:
+        # fallback to stable code (player_key)
+        pool["uid"] = pool["player_key"].astype("Int64").astype(str)
 
-    # drop clear duplicates (same FPL id)
-    pool = pool.sort_values("horizon_xpts", ascending=False).drop_duplicates("player_id")
+    # clean types
+    pool["now_cost"] = pd.to_numeric(pool["now_cost"], errors="coerce").fillna(0.0)
+    pool["horizon_xpts"] = pd.to_numeric(pool["horizon_xpts"], errors="coerce").fillna(0.0)
+    pool["mean_reliability"] = pd.to_numeric(pool["mean_reliability"], errors="coerce").fillna(0.0)
+
+    # restrict to valid positions
+    pool = pool[pool["position"].isin(["GKP", "DEF", "MID", "FWD"])].copy()
+
+    # guardrails on costs
+    pool = pool[(pool["now_cost"] >= 3.5) & (pool["now_cost"] <= 15.5)].copy()
+
+    # de-dup by uid (keep best by xPts, then cheaper)
+    pool = (pool.sort_values(["horizon_xpts", "now_cost"], ascending=[False, True])
+                 .drop_duplicates(subset=["uid"], keep="first"))
+
     return pool.reset_index(drop=True)
 
 
@@ -42,92 +67,72 @@ def pick_initial_squad(
     pos_limits: PositionLimits = None,
     club_limit: int = 3,
     reliability_weight: float = 0.3,
-    solver_time_limit: int | None = None,
+    solver_time_limit: Optional[int] = None,
 ) -> dict:
     """
-    Choose a legal 15-man squad maximizing (horizon_xpts * (0.7 + 0.3*reliability)).
-    - candidates: DataFrame with columns:
-        player_id, web_name, team_id, team_short, position (GKP/DEF/MID/FWD),
-        now_cost (float, in £m), horizon_xpts (float), mean_reliability (0..1 optional)
-    - budget: total budget in £m
-    - pos_limits: dict like {"GKP":2, "DEF":5, "MID":5, "FWD":3}
-    - club_limit: max 3 per club
-    - reliability_weight: blends reliability in objective:
-        score_i = xpts * (1 - w) + xpts * w * rel = xpts * [ (1-w) + w*rel ]
-    - solver_time_limit: seconds for CBC (optional)
+    MILP: choose a 15-player squad maximizing reliability-weighted horizon xPts
+    subject to budget, position counts, and club limit.
 
-    Returns dict with:
-      status, obj, selected (DataFrame of 15), by_position (dict), totals (dict)
+    candidates must include:
+      web_name, team_short, team_id, position, now_cost, horizon_xpts, mean_reliability
+      and either player_id or player_key (stable FPL 'code')
     """
-    if pos_limits is None:
-        pos_limits = DEFAULT_POS_LIMITS
-
     pool = _validate_pool(candidates)
+    if pos_limits is None:
+        pos_limits = PositionLimits()
 
-    # ensure reliability column
-    if "mean_reliability" not in pool.columns:
-        pool["mean_reliability"] = 1.0
-    pool["mean_reliability"] = pd.to_numeric(pool["mean_reliability"], errors="coerce").fillna(1.0).clip(0, 1)
-
-    # effective score
+    # weighted score
+    # score = HxPts * ( (1 - w) + w * reliability )
     w = float(reliability_weight)
-    pool["score"] = pool["horizon_xpts"] * ((1 - w) + w * pool["mean_reliability"])
+    pool = pool.copy()
+    pool["score"] = pool["horizon_xpts"] * ((1.0 - w) + w * pool["mean_reliability"])
 
-    # price to integer pennies (avoid floating solver issues): multiply by 10 (FPL costs are in £0.1m steps)
-    pool["price10"] = (pool["now_cost"] * 10 + 1e-6).astype(int)
-    budget10 = int(round(budget * 10))
+    # decision vars
+    prob = LpProblem("FPL_Initial_Squad", LpMaximize)
+    x = {uid: LpVariable(f"x_{uid}", lowBound=0, upBound=1, cat=LpBinary)
+         for uid in pool["uid"]}
 
-    # Variables
-    model = LpProblem("FPL_Initial_Squad", LpMaximize)
-    x = {i: LpVariable(f"x_{int(i)}", lowBound=0, upBound=1, cat=LpBinary) for i in pool.index}
+    # objective
+    prob += lpSum(pool.set_index("uid").loc[uid, "score"] * x[uid] for uid in x)
 
-    # Objective
-    model += lpSum(pool.loc[i, "score"] * x[i] for i in pool.index)
+    # budget
+    prob += lpSum(pool.set_index("uid").loc[uid, "now_cost"] * x[uid] for uid in x) <= budget
 
-    # Squad size
-    model += lpSum(x.values()) == 15, "squad_size_15"
+    # position counts
+    by_pos = pool.groupby("position")["uid"].apply(list).to_dict()
+    prob += lpSum(x[uid] for uid in by_pos.get("GKP", [])) == pos_limits.GKP
+    prob += lpSum(x[uid] for uid in by_pos.get("DEF", [])) == pos_limits.DEF
+    prob += lpSum(x[uid] for uid in by_pos.get("MID", [])) == pos_limits.MID
+    prob += lpSum(x[uid] for uid in by_pos.get("FWD", [])) == pos_limits.FWD
 
-    # Budget
-    model += lpSum(pool.loc[i, "price10"] * x[i] for i in pool.index) <= budget10, "budget"
+    # total squad size
+    prob += lpSum(x[uid] for uid in x) == pos_limits.SQUAD
 
-    # Position constraints
-    for pos, k in pos_limits.items():
-        idx = [i for i in pool.index if pool.loc[i, "position"] == pos]
-        model += lpSum(x[i] for i in idx) == k, f"count_{pos}_{k}"
+    # club limit: max N per team_id
+    for team_id, uids in pool.groupby("team_id")["uid"]:
+        prob += lpSum(x[uid] for uid in uids) <= club_limit
 
-    # Club constraints (max 3 per team)
-    for t in pool["team_id"].unique():
-        idx = [i for i in pool.index if pool.loc[i, "team_id"] == t]
-        model += lpSum(x[i] for i in idx) <= club_limit, f"club_cap_{t}"
+    # solve
+    solver = PULP_CBC_CMD(timeLimit=solver_time_limit) if solver_time_limit else PULP_CBC_CMD()
+    prob.solve(solver)
 
-    # Solve
-    cmd = PULP_CBC_CMD(msg=False, timeLimit=solver_time_limit) if solver_time_limit else PULP_CBC_CMD(msg=False)
-    model.solve(cmd)
+    status = prob.status  # 1 = Optimal
+    pool_idx = pool.set_index("uid")
 
-    status = LpStatus[model.status]
-    selected_idx: Iterable[int] = [i for i in pool.index if x[i].value() == 1]
-    chosen = pool.loc[selected_idx].copy().sort_values(["position", "score"], ascending=[True, False])
+    chosen_uids = [uid for uid in x if x[uid].value() == 1]
+    selected = pool_idx.loc[chosen_uids].reset_index()
 
-    # Totals
-    total_cost = chosen["now_cost"].sum()
-    total_xpts = chosen["horizon_xpts"].sum()
-    total_score = chosen["score"].sum()
-
-    by_pos = {
-        p: chosen[chosen["position"] == p][
-            ["web_name", "team_short", "now_cost", "horizon_xpts", "mean_reliability", "score"]
-        ].reset_index(drop=True)
-        for p in ["GKP", "DEF", "MID", "FWD"]
-    }
+    # objective components for reporting
+    total_cost = float(selected["now_cost"].sum()) if not selected.empty else 0.0
+    total_xpts = float(selected["horizon_xpts"].sum()) if not selected.empty else 0.0
+    total_score = float(selected["score"].sum()) if not selected.empty else 0.0
 
     return {
-        "status": status,
-        "obj": total_score,
-        "selected": chosen.reset_index(drop=True),
-        "by_position": by_pos,
+        "status": {1: "Optimal", -1: "Infeasible"}.get(status, str(status)),
+        "selected": selected,  # includes uid, player_id (if present), player_key (if present)
         "totals": {
-            "cost": round(total_cost, 1),
-            "horizon_xpts": round(total_xpts, 2),
-            "score": round(total_score, 2),
-        }
+            "cost": total_cost,
+            "horizon_xpts": total_xpts,
+            "score": total_score,
+        },
     }
